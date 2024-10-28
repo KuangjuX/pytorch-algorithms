@@ -19,16 +19,16 @@ class FlashDecoding:
         self.device = device
         
         
-    def flash_attn(self, q, k, v):
+    def flash_attn_split_kv(self, q, k, v):
         loop_n = self.ChunkN // self.SplitN
         
-        prev_maxes = torch.zeros(self.M, 1, device=self.device)
-        prev_sums = torch.zeros(self.M, 1, device=self.device)
-        
-        # LogSumExp(LSE) is a smooth maximum. LSE(x1,..., xn) = log(exp(x1) + ... + exp(xn))
-        lse = torch.zeros(self.M, 1, device=self.device)
-        
-        # output = self.output.view(self.M, self.P)
+        # The LogSumExp(LSE) is a smooth maximum,
+        # LSE(x1,...,xn) = log(exp(x1)+...+exp(xn))
+        # = c + log(exp(x1-c)+...+exp(xn-c))
+        # c = max(x1,...,xn)
+        lse = torch.full((self.M, 1), float('-inf'), device=self.device)
+        # prev_maxes: maximun up to the previous block.
+        prev_maxes = torch.full((self.M, 1), float('-inf'), device=self.device)
         output = torch.empty(self.M, self.P, device=self.device)
         
         ks = torch.chunk(k, loop_n, dim=-1)
@@ -37,34 +37,28 @@ class FlashDecoding:
         for n in range(loop_n):
             k = ks[n]
             v = vs[n]
+
+            qk = q @ k  # m * ktn
+            cur_maxes, _ = torch.max(qk, dim=-1, keepdim=True)
+            # cur_maxes: maximun up to the current block.
+            cur_maxes = torch.max(cur_maxes, lse)
+            p = torch.exp(qk - cur_maxes).half()
+            l_ij = torch.sum(p, dim=-1, keepdim=True)
+                
+            # renormalize o
+            acc_o_scale = torch.exp(prev_maxes - cur_maxes)
+            output = acc_o_scale * output + p @ v
+                
+            # Update statistics
+            prev_maxes = cur_maxes
+            l_i_new = torch.exp(lse - cur_maxes) + l_ij
+            lse = cur_maxes + torch.log(l_i_new)
             
-            attn_weights = q @ k
-            # reduce maxes
-            cur_maxes, _ = torch.max(attn_weights, dim=-1, keepdim=True)
-            exp_weights = torch.exp(attn_weights - cur_maxes)
-            # unnormalized attention score @ values
-            exp_values = exp_weights @ v
-            # move the normalization step to the very end of the attention computation.
-            cur_sums = torch.sum(exp_weights, dim=-1, keepdim=True)  # l(x_cur)
-
-            # =======================    renormalization  ======================#
-            new_maxes = torch.max(cur_maxes, prev_maxes)  # update m(x)
-            # renormalization factor for the previous block
-            renorm_prev = torch.exp(prev_maxes - new_maxes)
-            # renormalization factor for the current block
-            renorm_cur = torch.exp(cur_maxes - new_maxes)
-
-            # update normalization factor l(x)
-            new_sums = renorm_prev * prev_sums + renorm_cur * cur_sums
-
-            output = (output * prev_sums * renorm_prev +
-                      renorm_cur * exp_values) / new_sums
-
-            prev_sums = new_sums
-            prev_maxes = new_maxes
+        # o_scale is the denominator of the softmax function.    
+        o_scale = torch.exp(prev_maxes - lse)
+        output = o_scale * output  
             
-            
-        return output
+        return output, lse
         
     def forward(self):
         q = self.query.view(self.M, self.K)  # m * k
@@ -76,11 +70,26 @@ class FlashDecoding:
         ks = torch.chunk(k, loop_n, dim=-1)
         vs = torch.chunk(v, loop_n, dim=-2)
         
+        max_logic = torch.full((self.M, 1), float('-inf'), device=self.device)
+        acc = torch.zeros(self.M, self.P, device=self.device)
+        sum_exp = 0.0
+        
         for n in range(loop_n):
             k = ks[n]
             v = vs[n]
             
-            output, lse = self.flash_attn(q, k, v)
+            output, lse = self.flash_attn_split_kv(q, k, v)
             
-            # TODO: Compute the actual output by reducing over all the splits, using the log-sum-exp
-            # to scale the contribution of each split.
+            # Compute the actual output by reducing over all the splits, using the log-sum-exp to scale the contribution of each split.
+            
+            new_max_logic = torch.max(max_logic, lse)
+            
+            old_scale = torch.exp(max_logic - new_max_logic)
+            acc *= old_scale
+            
+            exp_logic = torch.exp(lse - new_max_logic)
+            acc += exp_logic * output
+            sum_exp = sum_exp * old_scale + exp_logic
+            max_logic = new_max_logic
+            
+        return acc / sum_exp
