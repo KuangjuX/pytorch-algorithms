@@ -45,6 +45,7 @@ class FlashAttention:
 
             # reduce maxes
             cur_maxes, _ = torch.max(attn_weights, dim=-1, keepdim=True)
+            # print('current block max:', cur_maxes)
             exp_weights = torch.exp(attn_weights - cur_maxes)
             # unnormalized attention score @ values
             exp_values = exp_weights @ v
@@ -77,8 +78,8 @@ class FlashAttention:
         # = c + log(exp(x1-c)+...+exp(xn-c))
         # c = max(x1,...,xn)
         lse = torch.full((self.M, 1), float('-inf'), device=self.device)
-        m_i = torch.full((self.M, 1), float('-inf'), device=self.device)
-
+        # prev_maxes: maximun up to the previous block.
+        prev_maxes = torch.full((self.M, 1), float('-inf'), device=self.device)
         output = torch.empty(self.M, self.P, device=self.device)
 
         dK = self.key.view(self.K, self.N)
@@ -95,22 +96,22 @@ class FlashAttention:
 
             qk = q @ k  # m * ktn
             cur_maxes, _ = torch.max(qk, dim=-1, keepdim=True)
-            m_ij = torch.max(cur_maxes, lse)
-            p = torch.exp(qk - m_ij).half()
+            # cur_maxes: maximun up to the current block.
+            cur_maxes = torch.max(cur_maxes, lse)
+            p = torch.exp(qk - cur_maxes).half()
             l_ij = torch.sum(p, dim=-1, keepdim=True)
                 
             # renormalize o
-            acc_o_scale = torch.exp(m_i - m_ij)
-            # print(acc_o_scale)
+            acc_o_scale = torch.exp(prev_maxes - cur_maxes)
             output = acc_o_scale * output + p @ v
                 
             # Update statistics
-            m_i = m_ij
-            l_i_new = torch.exp(lse - m_ij) + l_ij
-            lse = m_ij + torch.log(l_i_new)
+            prev_maxes = cur_maxes
+            l_i_new = torch.exp(lse - cur_maxes) + l_ij
+            lse = cur_maxes + torch.log(l_i_new)
         
         # o_scale is the denominator of the softmax function.    
-        o_scale = torch.exp(m_i - lse)
+        o_scale = torch.exp(prev_maxes - lse)
         output = o_scale * output
 
         return output
