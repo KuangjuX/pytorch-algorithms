@@ -73,6 +73,7 @@ class FlashDecoding:
         acc = torch.zeros(self.M, self.P, device=self.device)
         sum_exp = 0.0
         
+        # This loop should be mapped to different blocks for parallel execution.
         for n in range(loop_n):
             k = ks[n]
             v = vs[n]

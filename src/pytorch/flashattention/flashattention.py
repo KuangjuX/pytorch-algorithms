@@ -4,16 +4,13 @@ import unittest
 
 class FlashAttention:
 
-    def __init__(self, query, key, value, M, N, K, P, kTM, kTN, kTK, kTP, device = 'cpu'):
+    def __init__(self, query, key, value, M, N, K, P, ChunkN, device = 'cpu'):
         self.M = M
         self.N = N
         self.K = K
         self.P = P
 
-        self.kTM = kTM
-        self.kTN = kTN
-        self.kTK = kTK
-        self.kTP = kTP
+        self.ChunkN = ChunkN
 
         self.query = query
         self.key = key
@@ -22,7 +19,7 @@ class FlashAttention:
         self.device = device
 
     def forward(self):
-        loop_n = self.N // self.kTN
+        loop_n = self.N // self.ChunkN
 
         prev_maxes = torch.zeros(self.M, 1, device=self.device)
         prev_sums = torch.zeros(self.M, 1, device=self.device)
@@ -71,7 +68,7 @@ class FlashAttention:
         return output
     
     def forward_lse(self):
-        loop_n = self.N // self.kTN
+        loop_n = self.N // self.ChunkN
         
         # The LogSumExp(LSE) is a smooth maximum,
         # LSE(x1,...,xn) = log(exp(x1)+...+exp(xn))
