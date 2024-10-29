@@ -3,7 +3,7 @@ import torch
 
 class FlashDecoding:
 
-    def __init__(self, query, key, value, M, N, K, P, ChunkN, SplitN, device):
+    def __init__(self, query, key, value, M, N, K, P, ChunkN, SplitN, device = 'cpu'):
         self.M = M
         self.N = N
         self.K = K
@@ -14,7 +14,6 @@ class FlashDecoding:
         self.query = query
         self.key = key
         self.value = value
-        self.output = torch.empty(M, P, device)
         
         self.device = device
         
