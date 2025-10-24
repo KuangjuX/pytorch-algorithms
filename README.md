@@ -1,2 +1,9 @@
-# PyKernelCollection
-Collection of algorithms implemented using PyTorch and Triton.
+# PyTorchAlgorithms
+
+Collection of algorithms implemented with PyTorch.
+
+## Algorithms
+
+- FlashAttention
+- FlashDecoding
+- Streaming Attention
