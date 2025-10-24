@@ -36,7 +36,7 @@ def construct_streaming_mask(
         torch.Tensor: 一个布尔类型的注意力掩码张量，形状为 (seqlen_q, seqlen_k)。
                       `True` 表示该位置需要被掩码（忽略），`False` 表示保留。
     """
-    assert sink_size >= 0, "sink_size must be greater than 0"
+    assert sink_size >= 0, "sink_size must be greater than or equal to 0"
     assert local_size >= 1, "local_size must be greater than 0"
 
     # 创建行索引和列索引，用于构建注意力矩阵的坐标网格
@@ -196,7 +196,7 @@ def block_streaming_attention(
         # 这样在 softmax 后，这些位置的概率会变为 0
         if key_padding_mask is not None:
             key_mask = key_padding_mask[batch_idx, :seqlen_k].to(device)
-            scores = scores.masked_fill(~key_mask(1, 1, -1), float('-inf'))
+            scores = scores.masked_fill(~key_mask[None, None, :], float('-inf'))
 
         for head_idx in range(num_heads):
             mask_type = head_mask_type[head_idx].item()
@@ -235,7 +235,7 @@ def block_streaming_attention(
 
         if query_padding_mask is not None:
             query_mask = query_padding_mask[batch_idx, :seqlen_q].to(device)
-            attn = attn.masked_fill(~query_mask(1, -1, 1), 0.0)
+            attn = attn.masked_fill(~query_mask[None, :, None], 0.0)
 
         # 应用 dropout
         if p_dropout > 0.0:
@@ -257,7 +257,7 @@ def block_streaming_attention(
 
         if query_padding_mask is not None:
             query_mask = query_padding_mask[batch_idx, :seqlen_q].to(device)
-            out_batch = out_batch.masked_fill(~query_mask(-1, 1, 1), 0.0)
+            out_batch = out_batch.masked_fill(~query_mask[:, None, None], 0.0)
 
         output[q_start:q_end] = out_batch
 
