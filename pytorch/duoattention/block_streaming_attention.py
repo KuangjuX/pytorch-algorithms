@@ -17,7 +17,7 @@ def construct_streaming_mask(
     """
     构建用于 Streaming Attention 的注意力掩码。
 
-    该掩码结合了“注意力汇聚（sink）”和“局部滑动窗口（local window）”。
+    该掩码结合了"注意力汇聚（sink）"和"局部滑动窗口（local window）"。
     一个查询 token `i` 可以关注：
     1. 序列最开始的 `sink_size` 个 token。
     2. 在其局部窗口内的 `local_size` 个 token（包括自身）。
@@ -28,8 +28,10 @@ def construct_streaming_mask(
         sink_size (int): 注意力汇聚区的大小。
         local_size (int): 局部滑动窗口的大小。
         is_causal (bool): 是否应用因果约束。
-        query_padding_mask (Optional[torch.Tensor]): 查询序列的填充掩码。
-        key_padding_mask (Optional[torch.Tensor]): 键序列的填充掩码。
+        query_padding_mask (Optional[torch.Tensor]): 查询序列的填充掩码，形状为 (seqlen_q,)。
+                                                     True 表示有效 token，False 表示 padding。
+        key_padding_mask (Optional[torch.Tensor]): 键序列的填充掩码，形状为 (seqlen_k,)。
+                                                   True 表示有效 token，False 表示 padding。
         device (torch.device): 张量所在的设备。
 
     Returns:
@@ -55,17 +57,17 @@ def construct_streaming_mask(
         if query_padding_mask is not None or key_padding_mask is not None:
             # sk 是键序列的实际长度。如果没提供掩码，就用 seqlen_k。
             # 否则，通过对掩码求和得到实际长度 (假设真实 token 为 1，padding 为 0)。
-            # rearrange 用于调整维度以支持广播。
+            # 注意：padding_mask 现在是单个序列的掩码，形状为 (seqlen,)，而非批次级别
             sk = (
                 seqlen_k
                 if key_padding_mask is None 
-                else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
+                else key_padding_mask.sum().item()
             )
             # sq 是查询序列的实际长度，逻辑同上。
             sq = (
                 seqlen_q
                 if query_padding_mask is None
-                else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
+                else query_padding_mask.sum().item()
             )
         # 处理没有填充的简单情况 (seqlen_q, seqlen_k)
         else:
@@ -73,8 +75,9 @@ def construct_streaming_mask(
             sq = seqlen_q
 
         if query_padding_mask is not None or key_padding_mask is not None:
-            sk_tensor = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
-            beyond_causal = col_idx > torch.minimum(row_idx + sk - sq, sk_tensor)
+            # 对于带填充的情况，需要调整因果关系和窗口边界
+            # 因为实际序列可能比填充后的长度短
+            beyond_causal = col_idx > torch.minimum(row_idx + sk - sq, torch.tensor(sk, device=device))
             outside_window = torch.logical_and(
                 col_idx < row_idx + sk - sq - (local_size - 1),
                 col_idx >= sink_size
@@ -214,14 +217,22 @@ def block_streaming_attention(
                 sink_size = streaming_info[head_idx * 2].item()
                 local_size = streaming_info[head_idx * 2 + 1].item()
 
+                # 提取当前批次的填充掩码（如果存在）
+                query_mask_batch = None
+                key_mask_batch = None
+                if query_padding_mask is not None:
+                    query_mask_batch = query_padding_mask[batch_idx, :seqlen_q]
+                if key_padding_mask is not None:
+                    key_mask_batch = key_padding_mask[batch_idx, :seqlen_k]
+
                 streaming_mask = construct_streaming_mask(
                     seqlen_q=seqlen_q,
                     seqlen_k=seqlen_k,
                     sink_size=sink_size,
                     local_size=local_size,
                     is_causal=is_causal,
-                    query_padding_mask=query_padding_mask,
-                    key_padding_mask=key_padding_mask,
+                    query_padding_mask=query_mask_batch,
+                    key_padding_mask=key_mask_batch,
                     device=device
                 )
 
