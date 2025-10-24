@@ -127,11 +127,32 @@ def block_streaming_attention(
     key_padding_mask: Optional[torch.Tensor] = None,
     return_attn_probs: bool = False,
 ):
+    """
+    实现一个块状的、支持混合模式（密集、流式）的注意力机制。
 
+    Args:
+        q, k, v (torch.Tensor): 输入的查询、键、值张量。它们是批处理中所有序列拼接后的结果。
+                                形状为 (total_tokens, num_heads, head_dim)。
+        cu_seqlens_q, cu_seqlens_k (torch.Tensor): 累积序列长度。
+                                                  例如, 对于长度为 [L1, L2] 的批处理, cu_seqlens 为 [0, L1, L1+L2]。
+                                                  用于从 q, k, v 中切分出每个序列。
+        max_seqlen_q, max_seqlen_k (int): 批处理中最大的查询/键序列长度。
+        head_mask_type (torch.Tensor): 一个形状为 (num_heads,) 的张量，决定每个头的注意力类型。
+                                       0: Dense Attention
+                                       <0: Streaming Attention
+                                       >0: Block Sparse Attention (此处未实现)
+        streaming_info (torch.Tensor): 一个形状为 (num_heads * 2,) 的扁平化张量，
+                                       存储每个头的 [sink_size, local_size] 对。
+        p_dropout (float): Dropout 概率。
+        softmax_scale (Optional[float]): Softmax 的缩放因子。
+        is_causal (bool): 是否应用因果掩码。
+        ... (其他参数)
+    """
     device = q.device
     total_q, num_heads, head_dim = q.shape
     _, num_heads_k, _ = k.shape
     
+    # batch_size 可以从 cu_seqlens 的长度推断出来
     batch_size = cu_seqlens_q.shape[0] - 1
 
     if softmax_scale is None:
@@ -139,26 +160,40 @@ def block_streaming_attention(
 
     attn_weight_lists = [] if return_attn_probs else None
 
-    # GQA/MQA
+    # --- 2. 处理 GQA/MQA (分组查询注意力/多查询注意力) ---
+    # GQA/MQA 是一种优化，多个查询头共享同一组键/值头，以减少 KV 缓存大小
     if num_heads_k != num_heads:
+        # 确保查询头数量是键/值头数量的整数倍
         assert num_heads % num_heads_k == 0
+        # 使用 einops.repeat 将 K 和 V 的头复制，以匹配 Q 的头数，便于后续计算
         k = repeat(k, "t h d -> t (h g) d", g = num_heads // num_heads_k)
         v = repeat(v, "t h d -> t (h g) d", g = num_heads // num_heads_k)
 
     output = torch.zeros(total_q, num_heads, head_dim, device=device, dtype=q.dtype)
 
+    # --- 3. 主循环：逐个处理批处理中的序列 ---
     for batch_idx in range(batch_size):
+        # 使用累积长度来确定当前序列在拼接张量中的起止位置
         q_start, q_end = cu_seqlens_q[batch_idx].item(), cu_seqlens_q[batch_idx + 1].item()
         k_start, k_end = cu_seqlens_k[batch_idx].item(), cu_seqlens_k[batch_idx + 1].item()
 
+        # 从大张量中切片出当前序列的 q, k, v
         q_batch = q[q_start:q_end] #(seqlen_q, num_heads, head_dim)
         k_batch = k[k_start:k_end]
         v_batch = v[k_start:k_end]
 
         seqlen_q, seqlen_k = q_batch.shape[0], k_batch.shape[0] # query sequence length, key sequence length
 
+        # --- 4. 计算注意力分数 ---
+        # 使用 einsum 高效计算 Q 和 K 的点积，得到原始注意力分数
+        # "qhd,khd->hqk" 表示:
+        # qhd: (seqlen_q, num_heads, head_dim)
+        # khd: (seqlen_k, num_heads, head_dim)
+        # hqk: 输出 (num_heads, seqlen_q, seqlen_k)
         scores = torch.einsum("qhd,khd->hqk", q_batch * softmax_scale, k_batch) # (seqlen_q, seqlen_k)
 
+        # 如果有键填充掩码，则将填充位置的分数设置为负无穷
+        # 这样在 softmax 后，这些位置的概率会变为 0
         if key_padding_mask is not None:
             key_mask = key_padding_mask[batch_idx, :seqlen_k].to(device)
             scores = scores.masked_fill(~key_mask(1, 1, -1), float('-inf'))
@@ -169,11 +204,13 @@ def block_streaming_attention(
             if mask_type == 0: 
                 # Dense Attention
                 if is_causal:
-                    causal_mask = torch.triu(torch.full((seqlen_q, seqlen_k), float('-inf'), device=device), diagonal=1)
+                    causal_mask = torch.triu(torch.ones((seqlen_q, seqlen_k), dtype=torch.bool, device=device), diagonal=1)
                     scores[head_idx].masked_fill_(causal_mask, float('-inf'))
 
             elif mask_type < 0:
                 # Streaming Attention
+                # 模式 < 0: 流式注意力 (Streaming Attention)
+                # 从 streaming_info 中获取该头的 sink_size 和 local_size
                 sink_size = streaming_info[head_idx * 2].item()
                 local_size = streaming_info[head_idx * 2 + 1].item()
 
@@ -222,7 +259,7 @@ def block_streaming_attention(
             query_mask = query_padding_mask[batch_idx, :seqlen_q].to(device)
             out_batch = out_batch.masked_fill(~query_mask(-1, 1, 1), 0.0)
 
-        output[q_start:q_end, head_idx] = out_batch
+        output[q_start:q_end] = out_batch
 
         if return_attn_probs:
             attn_weight_lists.append(attn)
